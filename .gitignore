@@ -17,4 +17,5 @@ android/app/release/
 *.jks
 google-services.json
 !build/
+!build/*
 

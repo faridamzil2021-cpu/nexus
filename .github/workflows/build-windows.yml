@@ -67,6 +67,10 @@ jobs:
           VITE_BACKEND_URL: ${{ vars.VITE_BACKEND_URL || secrets.VITE_BACKEND_URL || 'https://ais-pre-6tyidv2pt6sibhftxu2mbu-884864254163.europe-west2.run.app' }}
         run: npm run build
 
+      - name: Ensure Windows desktop icon assets
+        shell: pwsh
+        run: node scripts/ensure-desktop-icon.mjs
+
       - name: Build Windows NSIS EXE Installer
         shell: pwsh
         env:
@@ -74,6 +78,7 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
         run: |
           npx electron-builder --win nsis --x64 --publish never "-c.extraMetadata.version=$env:RELEASE_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem -Path dist-electron
 
       - name: Upload Windows EXE artifact
