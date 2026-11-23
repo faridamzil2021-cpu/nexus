@@ -1,0 +1,132 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Optional semantic version for APK (e.g. 1.0.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android-apk:
+    name: Build Android Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install npm dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Build production web bundle
+        env:
+          VITE_BACKEND_URL: ${{ vars.VITE_BACKEND_URL || secrets.VITE_BACKEND_URL || 'https://ais-pre-6tyidv2pt6sibhftxu2mbu-884864254163.europe-west2.run.app' }}
+        run: npm run build
+
+      - name: Sync Capacitor Android project
+        run: npx cap sync android
+
+      - name: Prepare Firebase client config & optional release signing
+        env:
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_STRING: ${{ github.ref }}
+          RUN_NUMBER: ${{ github.run_number }}
+          ANDROID_GOOGLE_SERVICES_JSON: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          mkdir -p android/app/src/main/assets
+          cp firebase-applet-config.json android/app/src/main/assets/firebase-client-config.json
+
+          if [ -n "$ANDROID_GOOGLE_SERVICES_JSON" ]; then
+            printf '%s' "$ANDROID_GOOGLE_SERVICES_JSON" | base64 --decode > android/app/google-services.json
+            echo "Loaded android/app/google-services.json from secret."
+          fi
+
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "${{ runner.temp }}/nexus-release.keystore"
+            echo "ANDROID_KEYSTORE_PATH=${{ runner.temp }}/nexus-release.keystore" >> "$GITHUB_ENV"
+            echo "ANDROID_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "Release keystore configured for APK signing."
+          else
+            echo "::notice::ANDROID_KEYSTORE_BASE64 secret not set; Gradle will sign the release APK with Android's debug keystore for testing."
+          fi
+
+          if [[ "$REF_STRING" == refs/tags/v* ]]; then
+            CLEAN_VER="${REF_NAME#v}"
+          elif [ -n "$INPUT_VERSION_NAME" ]; then
+            CLEAN_VER="$INPUT_VERSION_NAME"
+          else
+            CLEAN_VER="1.0.${RUN_NUMBER}"
+          fi
+          echo "ANDROID_VERSION_NAME=$CLEAN_VER" >> "$GITHUB_ENV"
+          echo "ANDROID_VERSION_CODE=$RUN_NUMBER" >> "$GITHUB_ENV"
+
+      - name: Build Android Release APK with Gradle
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Stage APK artifact
+        run: |
+          mkdir -p artifacts-out
+          APK_FILE=$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$APK_FILE" ]; then
+            echo "No APK found in android/app/build/outputs/apk/release" >&2
+            exit 1
+          fi
+          cp "$APK_FILE" "artifacts-out/NEXUS-ROYALE-${ANDROID_VERSION_NAME}.apk"
+          ls -lh artifacts-out/
+
+      - name: Upload Android APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-royale-android-apk
+          path: artifacts-out/*.apk
+          if-no-files-found: error
+
+      - name: Publish Android APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts-out/*.apk
+          generate_release_notes: true

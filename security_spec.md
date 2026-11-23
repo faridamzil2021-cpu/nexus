@@ -1,0 +1,28 @@
+# NEXUS ROYALE Firestore Security Specification (Phase 0 TDD)
+
+## 1. Data Invariants
+1. **PII Isolation**: User email addresses and private NX wallet/vault inventory reside exclusively in `/players/{uid}`, which only the verified owner (`request.auth.uid == uid && request.auth.token.email_verified == true`) can `get`, `create`, or `update` (and `list` is always denied). Public profile reads use `/publicProfiles/{uid}` which contains zero PII.
+2. **Permanent Unique Player IDs**: `uid`, `playerId`, and `numericId` are immutable on both `/players/{uid}` and `/publicProfiles/{uid}`. The `/playerIdIndex/{idKey}` collection is create-only and immutable (`allow update, delete: if false`), preventing any two users from claiming the same `playerId` or `numericId` and preventing any overwrite of an existing ID mapping.
+3. **Verified Identity & Strict Timestamps**: All writes require `request.auth != null && request.auth.token.email_verified == true` and enforce server timestamps (`request.time`) on `createdAt` (create) and `updatedAt` / `lastSeenAt` (create & update).
+4. **One-Time Rename Lock**: Once `usernameChanged == true` on `/publicProfiles/{uid}`, it can never revert to `false` and `username` can never be mutated again.
+5. **Friend Request Integrity & Terminal State Locking**: A friend request document ID must equal `${fromUid}_${toUid}` with `fromUid == request.auth.uid`, `fromUid != toUid`, target profile existing in `/publicProfiles/{toUid}`, initial `status == 'pending'`, and no existing friendship. Only `toUid` may transition `status` from `'pending'` to `'accepted'` or `'rejected'`; once `'accepted'` or `'rejected'`, no further updates are permitted.
+6. **Atomic Friendship Creation (`getAfter`)**: Creating `/friendships/{uidA_uidB}` (where `uidA < uidB`) is only permitted inside an atomic batch that simultaneously transitions the corresponding `/friendRequests/{requestId}` (where `toUid == request.auth.uid`) to `status == 'accepted'`.
+7. **Presence Privacy & Anti-Scraping**: `/presence/{uid}` allows `get` only by the owner or an accepted friend (verified via `exists` on `/friendships/{canonicalPairId}`). Blanket `list` queries are disabled on `/players`, `/publicProfiles`, `/playerIdIndex`, and `/presence`, and strictly scoped via `resource.data` on `/friendRequests` and `/friendships`.
+
+## 2. The "Dirty Dozen" Attack Payloads (All Must Return PERMISSION_DENIED)
+1. **Cross-Owner PII Read**: Attacker (`uid_b`) attempts `get(/players/uid_a)` to read `uid_a`'s private email or vault.
+2. **Blanket User Enumeration (`list` Scraping)**: Attacker (`uid_a`) attempts `list(/publicProfiles)` or `list(/players)` or `list(/playerIdIndex)` to scrape all players.
+3. **Unverified Email Write**: Authenticated user with `email_verified: false` attempts `create(/publicProfiles/uid_a)` or `create(/friendRequests/...)`.
+4. **Shadow / Ghost Field Injection**: Owner (`uid_a`) sends an update or create on `/publicProfiles/uid_a` containing an undeclared ghost field `{ "isAdmin": true }` or `{ "role": "moderator" }`.
+5. **Immutable Player ID Hijack**: Owner (`uid_a`) attempts `update(/publicProfiles/uid_a, { playerId: "p_hijacked", numericId: "999999999" })` or overwrites `/playerIdIndex/123456789` owned by `uid_b`.
+6. **One-Time Username Lock Bypass**: Owner (`uid_a`) whose `usernameChanged == true` attempts `update(/publicProfiles/uid_a, { username: "HACKER", usernameChanged: false })`.
+7. **Timestamp Forgery (Denial of Temporal Integrity)**: Owner (`uid_a`) sends `createdAt: Timestamp(2099-01-01)` or `updatedAt: Timestamp(2000-01-01)` instead of `request.time`.
+8. **Self-Friend-Request / Spoofed Sender**: Attacker (`uid_a`) attempts `create(/friendRequests/uid_b_uid_c, { fromUid: "uid_b", toUid: "uid_c", status: "pending" })` or `create(/friendRequests/uid_a_uid_a, { fromUid: "uid_a", toUid: "uid_a" })`.
+9. **Friend Request Pre-Accepted Bypass**: Attacker (`uid_a`) attempts `create(/friendRequests/uid_a_uid_b, { fromUid: "uid_a", toUid: "uid_b", status: "accepted" })` to force an accepted state without recipient consent.
+10. **Sender Self-Accept & Terminal State Re-Open**: Sender (`uid_a`) attempts `update(/friendRequests/uid_a_uid_b, { status: "accepted" })` or anyone attempts to update a request whose existing `status` is `'rejected'` or `'accepted'`.
+11. **Non-Atomic Orphan Friendship Creation**: Attacker (`uid_a`) attempts `create(/friendships/uid_a_uid_b)` directly without an atomic batch accepting a pending friend request to `uid_a`.
+12. **Resource Exhaustion / ID Poisoning & Unauthorized Presence**: Attacker sends a 500-char document ID or 200-char `username` on `/publicProfiles`, or attacker (`uid_c`, not a friend) attempts `get(/presence/uid_a)`.
+13. **Party Capacity & Single-Party Enforcement**: `/parties/{partyId}` supports 2 to 4 players maximum (`memberUids.size() <= maxSize && maxSize in [2, 4]`), requires atomic `/partyMemberships/{uid}` binding so no verified player can belong to multiple parties simultaneously, and deletes empty parties cleanly when the final member leaves.
+14. **Party Leader & Friend-Only Invite Enforcement**: Only the verified `leaderUid` may invite online friends (verified via `/friendships/{canonicalPairId}` and `/presence/{toUid}`), kick members, resize capacity, or transfer leadership. Duplicate pending invites are blocked by deterministic ID `${partyId}_${toUid}`, and offline/non-friend invites are rejected.
+15. **Party Readiness & Status Integrity**: Members may only mutate their own entry in `/parties/{partyId}.members` (toggle `'ready'` / `'not-ready'` or `'in-match'`) without spoofing other members or elevating leadership.
+
