@@ -40,8 +40,31 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Setup Android SDK (API 36)
+        run: |
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK_DIR" ]; then
+            echo "Android SDK directory not found at $SDK_DIR" >&2
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+
+          if [ -x "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort -V | tail -n 1)
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under $SDK_DIR/cmdline-tools" >&2
+            exit 1
+          fi
+
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes 2>/dev/null | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+          echo "$SDK_DIR/platform-tools" >> "$GITHUB_PATH"
 
       - name: Install npm dependencies
         run: |
@@ -72,7 +95,9 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           mkdir -p android/app/src/main/assets
-          cp firebase-applet-config.json android/app/src/main/assets/firebase-client-config.json
+          if [ -f firebase-applet-config.json ]; then
+            cp firebase-applet-config.json android/app/src/main/assets/firebase-client-config.json
+          fi
 
           if [ -n "$ANDROID_GOOGLE_SERVICES_JSON" ]; then
             printf '%s' "$ANDROID_GOOGLE_SERVICES_JSON" | base64 --decode > android/app/google-services.json
@@ -104,7 +129,7 @@ jobs:
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Stage APK artifact
         run: |
